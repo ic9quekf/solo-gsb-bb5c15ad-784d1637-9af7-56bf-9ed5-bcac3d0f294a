@@ -33,14 +33,21 @@
 * ``emergency_unblind_events``：紧急揭盲的追加式审计记录
   （``window_opened`` / ``unblinded`` / ``window_expired``），只含审批人、
   原因与时间等元数据，**不含任何条件内容**；按自增 id 时间倒序分页查询。
+* ``result_snapshots``：脱敏结果快照，按 ``(实验, operation_id)`` 去重，
+  保存在单个一致性读事务内固定同一时点生成的不可变 JSON 快照
+  （仅已揭盲周期与完成时间，按 ``subject_id`` 稳定排序，绝不包含
+  ``sequence_index`` 或未揭盲安排）及其规范化 JSON 的 SHA-256 摘要；
+  快照只增不改，可按快照 ID 随时取回同一份内容。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import sqlite3
+import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -177,6 +184,17 @@ CREATE TABLE IF NOT EXISTS emergency_unblind_events (
     created_at        TEXT NOT NULL,
     UNIQUE (experiment_id, operation_id)
 );
+
+CREATE TABLE IF NOT EXISTS result_snapshots (
+    id            TEXT PRIMARY KEY,      -- 快照 ID（UUID hex）
+    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    operation_id  TEXT NOT NULL,         -- 调用方幂等键
+    fields        TEXT NOT NULL,         -- JSON：首次请求绑定的字段白名单（有序）
+    snapshot      TEXT NOT NULL,         -- JSON：不可变快照内容（仅已揭盲周期）
+    digest        TEXT NOT NULL,         -- snapshot 规范化 JSON 的 SHA-256（hex）
+    created_at    TEXT NOT NULL,         -- 与快照内 generated_at 同一固定时点
+    UNIQUE (experiment_id, operation_id)
+);
 """
 
 
@@ -297,6 +315,13 @@ class EmergencyWindowExpiredError(Exception):
 
 class EmergencyOperationIdConflictError(Exception):
     """operation_id 已被另一个紧急揭盲申请（不同受试者 / 审批人 / 原因）占用。"""
+
+
+class SnapshotOperationIdConflictError(Exception):
+    """operation_id 已被字段白名单不同的另一次快照请求占用。
+
+    冲突路径不携带任何条件 / 序列信息。
+    """
 
 
 class InvalidStateTransitionError(Exception):
@@ -1755,6 +1780,195 @@ def list_emergency_unblind_events(
             (experiment_id, limit, offset),
         ).fetchall()
     return [_emergency_unblind_event_dict(row) for row in rows]
+
+
+# 快照周期条目允许输出的字段（白名单候选），输出时按此规范顺序排列
+SNAPSHOT_ALLOWED_FIELDS = ("period", "condition", "revealed_at", "completed_at")
+
+
+def create_result_snapshot(
+    experiment_id: str,
+    fields: list[str],
+    operation_id: str,
+) -> dict[str, Any] | None:
+    """在单个一致性读事务内固定同一时点，生成不可变的脱敏结果快照。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：``(experiment_id, operation_id)`` 已存在时，仅当本次字段
+       白名单（含顺序）与首次完全一致才返回首次快照；不一致抛出
+       :class:`SnapshotOperationIdConflictError`；
+    2. 存在性检查：实验不存在时返回 ``None``（404）；
+    3. 一致性读：``generated_at`` 在事务内固定一次，名册（按 ``subject_id``
+       稳定排序）、已揭盲记录与完成记录均取自同一事务快照，期间无其他写入；
+    4. 落盘：快照内容（仅白名单字段、仅已揭盲周期，未完成周期
+       ``completed_at`` 为 ``None``）连同其规范化 JSON 的 SHA-256 摘要
+       一起写入 ``result_snapshots`` 并提交；快照只增不改。
+
+    全程不读取 ``assignments.sequence`` / ``sequence_index``，未揭盲周期与
+    后续安排一律不进入快照。返回首次 / 重放的快照载荷。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            result = _create_snapshot_locked(
+                conn, experiment_id, fields, operation_id
+            )
+            if result is not None and not result["_replayed"]:
+                conn.execute("COMMIT")
+                committed = True
+            if result is not None:
+                result.pop("_replayed", None)
+            return result
+        finally:
+            if not committed:
+                # 重放（只读）、409、404 或异常时结束事务
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def _create_snapshot_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    fields: list[str],
+    operation_id: str,
+) -> dict[str, Any] | None:
+    # 1) 幂等命中：字段白名单（含顺序）一致才返回首次快照，否则 409
+    snapshot_row = conn.execute(
+        "SELECT * FROM result_snapshots "
+        "WHERE experiment_id = ? AND operation_id = ?",
+        (experiment_id, operation_id),
+    ).fetchone()
+    if snapshot_row is not None:
+        if json.loads(snapshot_row["fields"]) != list(fields):
+            raise SnapshotOperationIdConflictError()
+        payload = _snapshot_payload(snapshot_row)
+        payload["_replayed"] = True
+        return payload
+
+    # 2) 实验必须存在（404 路径不泄露任何信息）
+    experiment_row = conn.execute(
+        "SELECT 1 FROM experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+    if experiment_row is None:
+        return None
+
+    # 3) 一致性读：同一事务快照内固定同一时点，期间无其他写入
+    generated_at = utc_now().isoformat()
+    # 名册只取 subject_id（按 subject_id 稳定排序），不触碰序列与序列下标
+    subject_rows = conn.execute(
+        "SELECT subject_id FROM assignments "
+        "WHERE experiment_id = ? ORDER BY subject_id",
+        (experiment_id,),
+    ).fetchall()
+    reveal_rows = conn.execute(
+        "SELECT subject_id, period, condition, revealed_at FROM unblindings "
+        "WHERE experiment_id = ? ORDER BY subject_id, period",
+        (experiment_id,),
+    ).fetchall()
+    completion_rows = conn.execute(
+        "SELECT subject_id, period, completed_at FROM period_completions "
+        "WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchall()
+
+    completed_at_by_key = {
+        (row["subject_id"], row["period"]): row["completed_at"]
+        for row in completion_rows
+    }
+    reveals_by_subject: dict[str, list[sqlite3.Row]] = {}
+    for row in reveal_rows:
+        reveals_by_subject.setdefault(row["subject_id"], []).append(row)
+
+    subjects: list[dict[str, Any]] = []
+    for subject_row in subject_rows:
+        subject_id = subject_row["subject_id"]
+        periods: list[dict[str, Any]] = []
+        for reveal in reveals_by_subject.get(subject_id, []):
+            # 只输出白名单字段，按规范顺序排列；未完成周期 completed_at 为 None
+            entry: dict[str, Any] = {}
+            if "period" in fields:
+                entry["period"] = reveal["period"]
+            if "condition" in fields:
+                entry["condition"] = reveal["condition"]
+            if "revealed_at" in fields:
+                entry["revealed_at"] = reveal["revealed_at"]
+            if "completed_at" in fields:
+                entry["completed_at"] = completed_at_by_key.get(
+                    (subject_id, reveal["period"])
+                )
+            periods.append(entry)
+        subjects.append({"subject_id": subject_id, "periods": periods})
+
+    content = {
+        "experiment_id": experiment_id,
+        "generated_at": generated_at,
+        "subjects": subjects,
+    }
+    # 摘要：规范化 JSON（键排序、紧凑分隔符、UTF-8）的 SHA-256
+    canonical = json.dumps(
+        content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    snapshot_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO result_snapshots "
+        "(id, experiment_id, operation_id, fields, snapshot, digest, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            snapshot_id,
+            experiment_id,
+            operation_id,
+            json.dumps(list(fields), ensure_ascii=False),
+            json.dumps(content, ensure_ascii=False),
+            digest,
+            generated_at,
+        ),
+    )
+
+    return {
+        "snapshot_id": snapshot_id,
+        "experiment_id": experiment_id,
+        "operation_id": operation_id,
+        "fields": list(fields),
+        "digest": digest,
+        "created_at": generated_at,
+        "snapshot": content,
+        "_replayed": False,
+    }
+
+
+def _snapshot_payload(row: sqlite3.Row) -> dict[str, Any]:
+    """快照行转响应载荷（内容与摘要均为落盘时的不可变值）。"""
+    return {
+        "snapshot_id": row["id"],
+        "experiment_id": row["experiment_id"],
+        "operation_id": row["operation_id"],
+        "fields": json.loads(row["fields"]),
+        "digest": row["digest"],
+        "created_at": row["created_at"],
+        "snapshot": json.loads(row["snapshot"]),
+    }
+
+
+def get_result_snapshot(
+    experiment_id: str, snapshot_id: str
+) -> dict[str, Any] | None:
+    """按快照 ID 取回不可变快照内容；实验或快照不存在时返回 ``None``。"""
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM result_snapshots "
+            "WHERE experiment_id = ? AND id = ?",
+            (experiment_id, snapshot_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return _snapshot_payload(row)
 
 
 def list_state_events(

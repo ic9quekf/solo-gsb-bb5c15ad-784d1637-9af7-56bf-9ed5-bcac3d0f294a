@@ -359,3 +359,74 @@ class EmergencyUnblindEventsOut(BaseModel):
 
     experiment_id: str
     events: list[EmergencyUnblindEventOut]
+
+
+class SnapshotCreate(BaseModel):
+    """脱敏结果快照创建请求：字段白名单 + 唯一操作键。"""
+
+    fields: list[Literal["period", "condition", "revealed_at", "completed_at"]] = (
+        Field(
+            ...,
+            min_length=1,
+            description=(
+                "输出字段白名单：period（周期）/ condition（条件）/ "
+                "revealed_at（揭盲时间）/ completed_at（完成时间），"
+                "至少 1 个且互异；未列入的字段不出现在快照中"
+            ),
+        )
+    )
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本次快照的唯一操作键（如 UUID），相同操作重试必须复用",
+    )
+
+    @model_validator(mode="after")
+    def _fields_must_be_distinct(self) -> "SnapshotCreate":
+        if len(set(self.fields)) != len(self.fields):
+            raise ValueError("fields 必须互异：存在重复字段")
+        return self
+
+
+class SnapshotPeriodEntry(BaseModel):
+    """快照中单个已揭盲周期。
+
+    仅包含请求白名单选中的字段（未选字段不出现在响应中）；
+    已揭盲但尚未完成的周期 ``completed_at`` 为 ``null``。
+    """
+
+    period: int | None = None
+    condition: str | None = None
+    revealed_at: str | None = None
+    completed_at: str | None = None
+
+
+class SnapshotSubjectEntry(BaseModel):
+    """单个受试者的快照条目：只含已揭盲周期，绝不包含序列或序列下标。"""
+
+    subject_id: str
+    periods: list[SnapshotPeriodEntry]
+
+
+class SnapshotContent(BaseModel):
+    """不可变快照内容：一致性读事务内固定时点（generated_at）的脱敏结果。"""
+
+    experiment_id: str
+    generated_at: str
+    subjects: list[SnapshotSubjectEntry]
+
+
+class SnapshotOut(BaseModel):
+    """快照元数据与内容。
+
+    ``digest`` 为快照内容规范化 JSON（键排序、紧凑分隔符、UTF-8）的
+    SHA-256（hex）；快照只增不改，相同 ``operation_id`` 重试返回同一份。
+    """
+
+    snapshot_id: str
+    experiment_id: str
+    operation_id: str
+    fields: list[str]
+    digest: str
+    created_at: str
+    snapshot: SnapshotContent

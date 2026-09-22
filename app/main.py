@@ -8,6 +8,9 @@
 创建与详情接口只返回受试者名册，不暴露任何后续周期安排。
 另提供双人审批（15 分钟授权窗口）的实验级紧急揭盲通道，
 审批与最终揭盲在单个 SQLite 写事务内完成，审计记录不含条件内容。
+另提供脱敏结果快照：在单个一致性读事务内固定同一时点，按 subject_id
+稳定排序生成仅含已揭盲周期与完成时间的不可变 JSON 快照（附 SHA-256
+摘要），相同 operation_id 幂等重放同一快照，可按快照 ID 随时取回。
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ from .schemas import (
     PauseRequest,
     ProgressOut,
     ResumeRequest,
+    SnapshotCreate,
+    SnapshotOut,
     StateEventOut,
     StateEventsOut,
     StateTransitionBatchOut,
@@ -54,7 +59,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Crossover Experiment Order Balancer",
     description="基于 Williams 平衡拉丁方的交叉实验顺序分配与按周期受控揭盲服务",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -622,3 +627,46 @@ def list_emergency_unblind_events(
     if events is None:
         raise HTTPException(status_code=404, detail="experiment not found")
     return {"experiment_id": experiment_id, "events": events}
+
+
+@app.post(
+    "/experiments/{experiment_id}/snapshots",
+    response_model=SnapshotOut,
+    response_model_exclude_unset=True,
+    summary=(
+        "生成脱敏结果快照：一致性读事务内固定同一时点，按 subject_id 稳定排序，"
+        "仅输出字段白名单内的已揭盲周期与完成时间（未完成周期为 null），"
+        "相同 operation_id 幂等返回同一快照"
+    ),
+)
+def create_snapshot(experiment_id: str, payload: SnapshotCreate) -> dict:
+    try:
+        result = db.create_result_snapshot(
+            experiment_id, payload.fields, payload.operation_id
+        )
+    except db.SnapshotOperationIdConflictError:
+        # 同一 operation_id 绑定了不同的字段白名单
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "operation_id 已被字段白名单不同的其他快照请求占用",
+                "reason": "operation_id_conflict",
+                "operation_id": payload.operation_id,
+            },
+        )
+    if result is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return result
+
+
+@app.get(
+    "/experiments/{experiment_id}/snapshots/{snapshot_id}",
+    response_model=SnapshotOut,
+    response_model_exclude_unset=True,
+    summary="按快照 ID 获取不可变快照内容（含 SHA-256 摘要）",
+)
+def get_snapshot(experiment_id: str, snapshot_id: str) -> dict:
+    snapshot = db.get_result_snapshot(experiment_id, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="snapshot not found")
+    return snapshot
