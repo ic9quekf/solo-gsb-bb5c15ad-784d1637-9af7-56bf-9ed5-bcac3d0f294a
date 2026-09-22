@@ -95,6 +95,34 @@
 - 紧急揭盲是带外（out-of-band）流程：**不改变**受试者的周期推进进度，
   也不受实验暂停状态影响。
 
+## 脱敏结果快照（masked result snapshot）
+
+针对监管报送、跨系统留痕等需要“**某一时点**的揭盲实况”的场景，提供不可变的
+**脱敏结果快照**。快照是只读导出，不揭盲任何新周期，实验暂停期间也可生成：
+
+- **单事务固定时点** `POST /experiments/{id}/snapshots`：请求体携带
+  `operation_id`（客户端幂等键）与字段白名单 `fields`。服务在**单个 SQLite
+  `BEGIN IMMEDIATE` 事务**内读取一个固定服务端时点（`taken_at`），随后全部
+  揭盲 / 完成数据均取自该事务的**同一一致性读快照**——快照提交后发生的
+  推进 / 完成不影响历史快照；
+- **稳定排序的不可变 JSON**：受试者严格按 `subject_id` 升序排列（与提交顺序
+  无关）；每个受试者的 `periods` 数组长度恒等于实验周期数，第 `k-1` 项对应
+  周期 `k`。**未揭盲周期为 `null`**；已揭盲周期只输出字段白名单允许的字段，
+  其中**未完成周期的 `completed_at` 为 `null`**；
+- **字段白名单**：`fields` 为 1～4 个互异字段，仅允许
+  `period` / `condition` / `revealed_at` / `completed_at`，条目键集合与白名单
+  完全一致；`subject_id` 恒定下发。`sequence_index` 等序列标识不在枚举内，
+  从模型层即无法请求，**快照任何路径都不下发 Williams 序列下标或完整条件序列**；
+- **摘要哈希**：对剔除 `digest` 后的规范 JSON（键序固定、紧凑分隔、不转义
+  非 ASCII）计算 SHA-256，随快照一起持久化（`digest`，64 位 hex），可用于
+  离线完整性校验；
+- **幂等**：相同 `(实验, operation_id)` 且**相同字段白名单（含顺序）**重试，
+  返回**同一个快照**（相同 `snapshot_id` / `taken_at` / `digest`，不重新生成、
+  不重复落盘）；同一 `operation_id` 绑定不同白名单返回
+  `409 snapshot_operation_id_conflict`；
+- **按 ID 获取** `GET /snapshots/{snapshot_id}`：返回该不可变快照的完整内容
+  （与首次创建响应逐字节同构），不存在返回 `404`。
+
 ## 快速启动（Docker Compose，一条命令）
 
 ```bash
@@ -104,10 +132,11 @@ docker compose up --build
 该命令会构建镜像并启动容器：构建时安装依赖，容器启动命令中再次校验依赖安装，
 应用启动钩子（lifespan）自动完成 SQLite 建表与迁移。**旧版本数据库无需手工迁移**：
 启动时新增的进度、揭盲、周期完成、单条幂等、批量揭盲、状态审计、批量状态切换、
-紧急揭盲幂等与紧急揭盲审计表通过 `CREATE TABLE IF NOT EXISTS` 自动补齐，
-`experiments` 表新增的 `washout_seconds`、`status`、`state_version` 列通过幂等的
-`ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、运行中（active）、
-状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、暂停与恢复、紧急揭盲。
+紧急揭盲幂等、紧急揭盲审计与脱敏结果快照表通过 `CREATE TABLE IF NOT EXISTS`
+自动补齐，`experiments` 表新增的 `washout_seconds`、`status`、`state_version`
+列通过幂等的 `ALTER TABLE ... DEFAULT` 补齐——**旧实验一律按 0 秒洗脱期、
+运行中（active）、状态版本 0 处理**，旧数据保留且可继续揭盲、登记完成、
+暂停与恢复、紧急揭盲与导出快照。
 
 - **访问地址**：http://localhost:8000
 - **交互式 API 文档（Swagger UI）**：http://localhost:8000/docs
@@ -653,6 +682,75 @@ curl 'http://localhost:8000/experiments/<experiment_id>/emergency-unblind-events
 - 审计记录只增不改；从未申请过紧急揭盲的实验返回 `events: []`；
 - 实验不存在返回 `404`。
 
+### 生成脱敏结果快照 `POST /experiments/{experiment_id}/snapshots`
+
+固定某一时点的不可变脱敏快照，请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `operation_id` | 本次快照的唯一操作键（如 UUID），相同操作重试必须复用 |
+| `fields` | 字段白名单（**有序、互异**，至少 1 个），仅允许 `period` / `condition` / `revealed_at` / `completed_at`；`subject_id` 恒含；不允许 `sequence_index` 等序列标识 |
+
+```bash
+curl -X POST http://localhost:8000/experiments/<experiment_id>/snapshots \
+  -H 'Content-Type: application/json' \
+  -d '{"operation_id": "a31f…",
+       "fields": ["period", "condition", "revealed_at", "completed_at"]}'
+```
+
+成功返回 `200`。受试者按 `subject_id` 升序排列；`periods` 数组按下标对齐周期
+序号，**未揭盲周期为 `null`**；已揭盲但未完成周期的 `completed_at` 为 `null`；
+周期条目只含白名单字段：
+
+```json
+{
+  "snapshot_id": "4f9c0855…",
+  "experiment_id": "…",
+  "operation_id": "a31f…",
+  "fields": ["period", "condition", "revealed_at", "completed_at"],
+  "taken_at": "2026-09-22T09:00:00.000000+00:00",
+  "subjects": [
+    {
+      "subject_id": "s0",
+      "periods": [
+        {"period": 1, "condition": "A", "revealed_at": "…",
+         "completed_at": "2026-09-22T08:30:00.000000+00:00"},
+        null
+      ]
+    },
+    {
+      "subject_id": "s1",
+      "periods": [
+        {"period": 1, "condition": "B", "revealed_at": "…",
+         "completed_at": null},
+        null
+      ]
+    }
+  ],
+  "digest": "46000c1d…（64 位 hex SHA-256）"
+}
+```
+
+- `taken_at`：快照在写事务内固定的服务端时点；快照之后的推进 / 完成
+  **不改变**历史快照（同一 `snapshot_id` 永远返回同一内容）；
+- `digest`：对剔除 `digest` 后的规范 JSON（键名递归排序、`,` / `:`
+  紧凑分隔、非 ASCII 不转义、UTF-8）取 SHA-256 的 hex，可离线复算校验；
+- 相同 `(实验, operation_id)` 与**相同字段白名单（含顺序）**重试返回
+  **同一个快照**（`snapshot_id` / `taken_at` / `digest` 均不变）；白名单字段或
+  顺序不同返回 `409 snapshot_operation_id_conflict`；
+- 白名单为空、含非法字段（如 `sequence_index`、`sequence`）或字段重复返回
+  `422`；`operation_id` 缺失 / 为空返回 `422`；实验不存在返回 `404`。
+
+### 获取快照 `GET /snapshots/{snapshot_id}`
+
+按快照 ID 获取不可变快照内容，结构与创建响应完全一致（同样按白名单裁剪键集合）：
+
+```bash
+curl http://localhost:8000/snapshots/<snapshot_id>
+```
+
+快照不存在返回 `404`（`{"detail": "snapshot not found"}`）。
+
 ### 其他接口
 
 - `GET /experiments/{experiment_id}`：查询实验（受试者名册 + 条件清单 +
@@ -664,7 +762,7 @@ curl 'http://localhost:8000/experiments/<experiment_id>/emergency-unblind-events
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、旧库迁移校验）
+pytest                         # 运行测试（含序列平衡、幂等、门禁、409 并发、暂停/恢复、批量状态切换、紧急揭盲双审批、脱敏快照、旧库迁移校验）
 uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 ```
 
@@ -675,7 +773,7 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
 - **确定性分配**（`app/main.py`）：将完整序列组复制 `受试者数 / 组大小` 份构成序列池，
   用 `random.Random(seed)` 打乱后依次映射给受试者，因此相同输入与种子结果一致。
   序列只写入服务端存储，不进入创建 / 详情响应。
-- **存储**（`app/db.py`，SQLite）共十二张表，启动时幂等迁移（旧库自动补齐）：
+- **存储**（`app/db.py`，SQLite）共十三张表，启动时幂等迁移（旧库自动补齐）：
   - `experiments`：含 `washout_seconds`、`status`（`active` / `paused`）与
     `state_version`（旧库缺列时分别 `ALTER TABLE ... DEFAULT 0 / 'active' / 0` 补齐）；
   - `assignments`：受试者完整序列（服务端持有）；
@@ -696,7 +794,19 @@ uvicorn app.main:app --reload  # 本地启动，默认 http://127.0.0.1:8000
     仅供相同 `operation_id` 幂等重放）；
   - `emergency_unblind_events`：紧急揭盲的追加式审计记录（`window_opened` /
     `unblinded` / `window_expired`，自增 `id` 时间倒序），只含审批人、原因与
-    时间等元数据，**不含任何条件内容**。
+    时间等元数据，**不含任何条件内容**；
+  - `result_snapshots`：脱敏结果快照（主键 `snapshot_id`，
+    `(实验, operation_id)` 唯一）。保存首次请求绑定的字段白名单、固定时点
+    `taken_at`、不含自引用摘要的不可变 JSON 内容 `content` 与其 SHA-256
+    `digest`；相同 operation_id 且白名单一致时幂等返回同一行。
+- **快照的一致性与脱敏**：快照生成在单个 `BEGIN IMMEDIATE` 事务内完成
+  “幂等检查 → 固定服务端时点 → 读取同一事务一致性快照中的揭盲 / 完成记录 →
+  组装并计算摘要 → 落盘提交”。受试者按 `subject_id` 稳定排序，周期槽按下标
+  对齐周期序号，未揭盲周期以 `null` 占位；组装只读取 `unblindings.condition`
+  （已揭盲周期的条件）与完成时间，**不读取 `assignments.sequence_index` /
+  `sequence`**，加之字段白名单在 Pydantic 枚举层封闭，`sequence_index` 无任何
+  泄露路径。并发同一 `operation_id` 由写事务串行化，唯一约束保证只落一行、
+  全员拿到同一 `snapshot_id` / `digest`。
 - **暂停 / 恢复的原子性**：暂停与恢复都在单个 `BEGIN IMMEDIATE` 写事务内完成
   “幂等检查 → 状态 / 版本校验 → 更新 `experiments` 并追加审计 → 提交”。
   恢复以 `state_version` 做 compare-and-set，版本不符整体回滚并返回 `409`，

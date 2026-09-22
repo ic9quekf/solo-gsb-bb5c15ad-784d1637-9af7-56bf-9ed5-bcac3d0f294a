@@ -359,3 +359,87 @@ class EmergencyUnblindEventsOut(BaseModel):
 
     experiment_id: str
     events: list[EmergencyUnblindEventOut]
+
+
+# 快照周期条目允许下发的脱敏字段白名单（subject_id 恒含，不在此列）。
+# 不允许出现 sequence_index 等序列标识，从枚举层杜绝泄露。
+SnapshotField = Literal["period", "condition", "revealed_at", "completed_at"]
+
+# 全部允许的白名单字段（校验重复项使用，顺序固定）
+SNAPSHOT_ALL_FIELDS: tuple[str, ...] = (
+    "period",
+    "condition",
+    "revealed_at",
+    "completed_at",
+)
+
+
+class SnapshotCreateRequest(BaseModel):
+    """脱敏结果快照请求：字段白名单 + 客户端幂等键。"""
+
+    operation_id: str = Field(
+        ...,
+        min_length=1,
+        description="本次快照的唯一操作键（如 UUID），相同操作重试必须复用",
+    )
+    fields: list[SnapshotField] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "周期条目字段白名单（有序、互异），仅允许 "
+            "period / condition / revealed_at / completed_at；"
+            "subject_id 恒含；禁止任何 sequence_index 等序列标识"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _fields_must_be_distinct(self) -> "SnapshotCreateRequest":
+        seen: set[str] = set()
+        for name in self.fields:
+            if name in seen:
+                raise ValueError("fields 必须互异：白名单中存在重复字段")
+            seen.add(name)
+        return self
+
+
+class SnapshotPeriodEntry(BaseModel):
+    """快照中一个**已揭盲**周期的脱敏条目，键集合完全由字段白名单决定。
+
+    未揭盲周期不会产生本对象，而是在周期数组中以 ``null`` 占位；
+    已揭盲但未登记完成时 ``completed_at`` 为 ``None``。
+    """
+
+    period: int | None = None
+    condition: str | None = None
+    revealed_at: str | None = None
+    completed_at: str | None = None
+
+
+class SnapshotSubject(BaseModel):
+    """快照中的一个受试者：``subject_id`` 恒含，周期数组按下标对齐周期序号。"""
+
+    subject_id: str
+    # 第 k-1 个元素对应周期 k：未揭盲周期恒为 null
+    periods: list[SnapshotPeriodEntry | None]
+
+
+class SnapshotOut(BaseModel):
+    """不可变脱敏结果快照。
+
+    周期数组长度恒等于实验周期数，第 ``k-1`` 项对应周期 ``k``：
+    未揭盲周期为 ``null``；已揭盲周期只含字段白名单允许的字段，
+    未完成周期的 ``completed_at`` 为 ``null``。任何路径都不含
+    ``sequence_index`` / 完整条件序列。
+    """
+
+    snapshot_id: str
+    experiment_id: str
+    operation_id: str
+    fields: list[SnapshotField]
+    taken_at: str
+    subjects: list[SnapshotSubject]
+    digest: str = Field(
+        ...,
+        min_length=1,
+        description="快照内容的 SHA-256 摘要（hex），对剔除 digest 后的规范 JSON 计算",
+    )

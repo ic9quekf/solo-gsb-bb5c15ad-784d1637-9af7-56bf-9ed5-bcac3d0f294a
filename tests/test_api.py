@@ -3223,3 +3223,431 @@ def test_legacy_database_supports_emergency_unblind_after_migration(
         ).json()["events"]
         assert [e["action"] for e in events] == ["unblinded", "window_opened"]
         assert_no_sequence_leak(events)
+
+
+# ---------- 脱敏结果快照（immutable masked snapshot） ----------
+
+def create_snapshot(
+    client: TestClient,
+    experiment_id: str,
+    fields: list[str],
+    operation_id: str,
+):
+    return client.post(
+        f"/experiments/{experiment_id}/snapshots",
+        json={"operation_id": operation_id, "fields": fields},
+    )
+
+
+def snapshot_digest(snapshot: dict) -> str:
+    """按服务端相同规则复算摘要（剔除 digest、键序固定、紧凑 JSON）。"""
+    import hashlib
+    import json
+
+    content = {k: v for k, v in snapshot.items() if k != "digest"}
+    canonical = json.dumps(
+        content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def test_snapshot_contains_only_revealed_periods_sorted_and_masked(
+    client: TestClient,
+) -> None:
+    # 受试者名册乱序提交（s3、s1、s0、s2），快照必须按 subject_id 稳定排序
+    body, subject_ids = create_experiment(
+        client,
+        conditions=["A", "B", "C"],
+        subject_ids=["s3", "s1", "s0", "s2", "s5", "s4"],
+        seed=42,
+    )
+    eid = body["experiment_id"]
+
+    # s1 揭盲周期 1（不登记完成）；s0 走完周期 1（揭盲 + 完成）；其余人无揭盲
+    p1_s1 = reveal_period(client, eid, "s1", 1).json()
+    p1_s0 = reveal_period(client, eid, "s0", 1).json()
+    done_s0 = complete_period(client, eid, "s0", 1, "s0-c1").json()
+
+    resp = create_snapshot(
+        client,
+        eid,
+        ["period", "condition", "revealed_at", "completed_at"],
+        "snap-1",
+    )
+    assert resp.status_code == 200, resp.text
+    snap = resp.json()
+
+    assert snap["experiment_id"] == eid
+    assert snap["operation_id"] == "snap-1"
+    assert snap["fields"] == [
+        "period", "condition", "revealed_at", "completed_at"
+    ]
+    assert "snapshot_id" in snap and len(snap["snapshot_id"]) == 32
+    assert "taken_at" in snap
+    assert len(snap["digest"]) == 64
+    assert snap["digest"] == snapshot_digest(snap)
+
+    # 受试者按 subject_id 稳定排序，全员在册（无人因未揭盲而缺失）
+    assert [s["subject_id"] for s in snap["subjects"]] == sorted(subject_ids)
+    by_subject = {s["subject_id"]: s["periods"] for s in snap["subjects"]}
+
+    # 未揭盲受试者：三个周期槽全部为 null，且数组长度等于周期数
+    assert by_subject["s2"] == [None, None, None]
+    assert by_subject["s3"] == [None, None, None]
+
+    # s1 周期 1 已揭盲未完成：completed_at 为 null；周期 2/3 为 null
+    assert by_subject["s1"] == [
+        {
+            "period": 1,
+            "condition": p1_s1["condition"],
+            "revealed_at": p1_s1["revealed_at"],
+            "completed_at": None,
+        },
+        None,
+        None,
+    ]
+
+    # s0 周期 1 已揭盲并完成
+    assert by_subject["s0"][0] == {
+        "period": 1,
+        "condition": p1_s0["condition"],
+        "revealed_at": p1_s0["revealed_at"],
+        "completed_at": done_s0["completed_at"],
+    }
+    assert by_subject["s0"][1:] == [None, None]
+
+    # 任何层级都不得出现 sequence / sequence_index
+    assert_no_sequence_leak(snap)
+
+
+def test_snapshot_field_whitelist_filters_period_keys(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    reveal_period(client, eid, "s1", 1)
+
+    resp = create_snapshot(client, eid, ["completed_at"], "snap-wl")
+    assert resp.status_code == 200, resp.text
+    periods = resp.json()["subjects"][0]["periods"]
+    # 白名单仅 completed_at：条目只含该键（值为 null）；subject_id 恒含
+    assert periods[0] == {"completed_at": None}
+    assert set(periods[0].keys()) == {"completed_at"}
+    assert "condition" not in periods[0]
+    assert "period" not in periods[0]
+    assert "revealed_at" not in periods[0]
+    # 未揭盲周期仍为 null
+    assert periods[1] is None
+
+    # 不含 completed_at 时，未完成信息也不下发（已揭盲周期为非空对象）
+    resp2 = create_snapshot(client, eid, ["condition"], "snap-wl2")
+    first = resp2.json()["subjects"][0]["periods"][0]
+    assert set(first.keys()) == {"condition"}
+    assert first["condition"] in {"A", "B"}
+
+
+def test_snapshot_immutable_point_in_time(client: TestClient, monkeypatch) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    reveal_period(client, eid, "s1", 1)
+
+    first = create_snapshot(
+        client, eid, ["period", "condition", "completed_at"], "snap-time"
+    )
+    assert first.status_code == 200
+    snap1 = first.json()
+
+    # 快照之后发生的揭盲 / 完成推进不得改变历史快照
+    complete_period(client, eid, "s1", 1, "c1")
+    reveal_period(client, eid, "s1", 2)
+    reveal_period(client, eid, "s2", 1)
+
+    fetched = client.get(f"/snapshots/{snap1['snapshot_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json() == snap1
+
+    # s1 周期 1 的 completed_at 仍为 null（时点固定），周期 2 仍为 null
+    periods = snap1["subjects"][0]["periods"]
+    assert periods[0]["completed_at"] is None
+    assert periods[1] is None
+    # s2 在快照相机下全员未揭盲
+    s2 = next(s for s in snap1["subjects"] if s["subject_id"] == "s2")
+    assert s2["periods"] == [None, None]
+
+
+def test_snapshot_operation_id_is_idempotent_and_get_returns_same(
+    client: TestClient,
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    reveal_period(client, eid, "s1", 1)
+    fields = ["period", "condition", "revealed_at", "completed_at"]
+
+    first = create_snapshot(client, eid, fields, "idem-snap")
+    assert first.status_code == 200
+    first_body = first.json()
+
+    for _ in range(3):
+        replay = create_snapshot(client, eid, fields, "idem-snap")
+        assert replay.status_code == 200
+        assert replay.json() == first_body
+
+    # 按快照 ID 获取内容完全一致
+    got = client.get(f"/snapshots/{first_body['snapshot_id']}")
+    assert got.status_code == 200
+    assert got.json() == first_body
+
+    # 同一 operation_id 绑定不同字段白名单（字段 / 顺序不同）→ 409
+    conflict = create_snapshot(client, eid, ["period"], "idem-snap")
+    assert conflict.status_code == 409
+    detail = conflict.json()["detail"]
+    assert detail["reason"] == "snapshot_operation_id_conflict"
+    assert detail["operation_id"] == "idem-snap"
+
+    # 冲突不影响原快照获取
+    assert client.get(
+        f"/snapshots/{first_body['snapshot_id']}"
+    ).json() == first_body
+
+
+def test_snapshot_fields_validation(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    # 空白名单
+    assert create_snapshot(client, eid, [], "v1").status_code == 422
+    # 白名单含非法字段（sequence_index 被枚举层拒绝）
+    assert create_snapshot(
+        client, eid, ["sequence_index"], "v2"
+    ).status_code == 422
+    assert create_snapshot(
+        client, eid, ["period", "sequence"], "v3"
+    ).status_code == 422
+    # 白名单重复字段
+    assert create_snapshot(
+        client, eid, ["period", "period"], "v4"
+    ).status_code == 422
+    # operation_id 缺失 / 为空
+    resp = client.post(
+        f"/experiments/{eid}/snapshots",
+        json={"fields": ["period"]},
+    )
+    assert resp.status_code == 422
+    assert create_snapshot(client, eid, ["period"], "").status_code == 422
+
+
+def test_snapshot_unknown_experiment_and_snapshot_return_404(
+    client: TestClient,
+) -> None:
+    assert create_snapshot(
+        client, "missing", ["period"], "x"
+    ).status_code == 404
+    assert client.get("/snapshots/deadbeef").status_code == 404
+
+
+def test_snapshot_fresh_experiment_all_periods_null(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B", "C"],
+        subject_ids=[f"s{i}" for i in range(6)], seed=1,
+    )
+    eid = body["experiment_id"]
+    resp = create_snapshot(
+        client, eid, ["period", "condition", "completed_at"], "empty-snap"
+    )
+    assert resp.status_code == 200
+    snap = resp.json()
+    assert len(snap["subjects"]) == 6
+    assert [s["subject_id"] for s in snap["subjects"]] == [
+        f"s{i}" for i in range(6)
+    ]
+    for subject in snap["subjects"]:
+        assert subject["periods"] == [None, None, None]
+    assert snap["digest"] == snapshot_digest(snap)
+    assert_no_sequence_leak(snap)
+
+
+def test_snapshot_all_periods_completed(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    sequence = reveal_sequence(client, eid, "s1", 2)  # 两周期全部揭盲并完成
+    assert complete_period(client, eid, "s1", 2, "s1-c2").status_code == 200
+
+    resp = create_snapshot(
+        client, eid, ["period", "condition", "completed_at"], "full-snap"
+    )
+    assert resp.status_code == 200
+    periods = resp.json()["subjects"][0]["periods"]
+    assert [entry["condition"] for entry in periods] == sequence
+    assert all(entry["completed_at"] is not None for entry in periods)
+    assert [entry["period"] for entry in periods] == [1, 2]
+
+
+def test_snapshot_allowed_while_paused(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+    reveal_period(client, eid, "s1", 1)
+    assert pause_experiment(client, eid, "hold").status_code == 200
+
+    # 快照是只读导出，不揭盲新周期，暂停期间仍可生成
+    resp = create_snapshot(client, eid, ["period", "condition"], "paused-snap")
+    assert resp.status_code == 200, resp.text
+    periods = resp.json()["subjects"][0]["periods"]
+    assert periods[0]["period"] == 1
+    assert "condition" in periods[0]
+    assert periods[1] is None
+
+
+def test_snapshot_digest_changes_with_content(client: TestClient) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=1
+    )
+    eid = body["experiment_id"]
+
+    before = create_snapshot(client, eid, ["period", "condition"], "before")
+    assert before.status_code == 200
+    reveal_period(client, eid, "s1", 1)
+    after = create_snapshot(client, eid, ["period", "condition"], "after")
+    assert after.status_code == 200
+
+    # 不同内容（不同白名单的另一个快照也一样）→ 不同快照 ID 与摘要
+    assert before.json()["snapshot_id"] != after.json()["snapshot_id"]
+    assert before.json()["digest"] != after.json()["digest"]
+    assert after.json()["digest"] == snapshot_digest(after.json())
+
+
+def test_concurrent_snapshot_same_operation_id_returns_one_snapshot(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "conc-snapshot.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 51,
+            },
+        ).json()
+        setup.post(
+            f"/experiments/{created['experiment_id']}/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "a1"},
+        )
+    eid = created["experiment_id"]
+
+    n_threads = 8
+    barrier = threading.Barrier(n_threads)
+    snapshots: list[dict] = []
+    snapshots_lock = threading.Lock()
+
+    def worker() -> None:
+        with TestClient(app) as local_client:
+            barrier.wait()
+            resp = local_client.post(
+                f"/experiments/{eid}/snapshots",
+                json={
+                    "operation_id": "race-snap",
+                    "fields": ["period", "condition", "completed_at"],
+                },
+            )
+            with snapshots_lock:
+                snapshots.append(resp.json())
+                assert resp.status_code == 200, resp.text
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # BEGIN IMMEDIATE 串行化：全部返回同一个快照（相同 ID / 摘要 / 时点）
+    assert len(snapshots) == n_threads
+    assert len({s["snapshot_id"] for s in snapshots}) == 1
+    assert len({s["digest"] for s in snapshots}) == 1
+    assert len({s["taken_at"] for s in snapshots}) == 1
+
+
+def test_legacy_database_supports_snapshots_after_migration(
+    tmp_path, monkeypatch,
+) -> None:
+    db_path = tmp_path / "legacy-snapshot.db"
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY,
+                conditions TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                group_size INTEGER NOT NULL,
+                num_subjects INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE assignments (
+                experiment_id TEXT NOT NULL REFERENCES experiments(id),
+                subject_id TEXT NOT NULL,
+                sequence_index INTEGER NOT NULL,
+                sequence TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, subject_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiments "
+            "(id, conditions, seed, group_size, num_subjects, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("legacy-snap", '["A","B"]', 1, 2, 2, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-snap", "s1", 0, '["A","B"]'),
+        )
+        conn.execute(
+            "INSERT INTO assignments "
+            "(experiment_id, subject_id, sequence_index, sequence) "
+            "VALUES (?, ?, ?, ?)",
+            ("legacy-snap", "s2", 1, '["B","A"]'),
+        )
+
+    # 启动自动建表迁移后，快照在旧库上可用：无揭盲即全员全周期 null
+    with TestClient(app) as migrated:
+        resp = migrated.post(
+            "/experiments/legacy-snap/snapshots",
+            json={
+                "operation_id": "snap-legacy-1",
+                "fields": ["period", "condition", "completed_at"],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        snap = resp.json()
+        assert [s["subject_id"] for s in snap["subjects"]] == ["s1", "s2"]
+        for subject in snap["subjects"]:
+            assert subject["periods"] == [None, None]
+        assert snap["digest"] == snapshot_digest(snap)
+        assert_no_sequence_leak(snap)
+
+        # 幂等重放与按 ID 获取
+        replay = migrated.post(
+            "/experiments/legacy-snap/snapshots",
+            json={
+                "operation_id": "snap-legacy-1",
+                "fields": ["period", "condition", "completed_at"],
+            },
+        )
+        assert replay.status_code == 200
+        assert replay.json() == snap
+        got = migrated.get(f"/snapshots/{snap['snapshot_id']}")
+        assert got.status_code == 200
+        assert got.json() == snap

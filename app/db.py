@@ -33,14 +33,22 @@
 * ``emergency_unblind_events``：紧急揭盲的追加式审计记录
   （``window_opened`` / ``unblinded`` / ``window_expired``），只含审批人、
   原因与时间等元数据，**不含任何条件内容**；按自增 id 时间倒序分页查询。
+* ``result_snapshots``：脱敏结果快照，按 ``(实验, operation_id)`` 去重。
+  快照在单个 ``BEGIN IMMEDIATE`` 事务内固定同一时点生成，受试者按
+  subject_id 稳定排序；只含已揭盲周期（未揭盲周期以 ``null`` 占位），
+  未完成周期的 completed_at 为 NULL，**任何路径都不下发 sequence_index**。
+  保存首次请求绑定的字段白名单、不可变 JSON 内容（``content``）与其
+  SHA-256 摘要（``digest``），相同 operation_id 幂等返回同一快照。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import sqlite3
+import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -177,6 +185,18 @@ CREATE TABLE IF NOT EXISTS emergency_unblind_events (
     created_at        TEXT NOT NULL,
     UNIQUE (experiment_id, operation_id)
 );
+
+CREATE TABLE IF NOT EXISTS result_snapshots (
+    snapshot_id   TEXT PRIMARY KEY,      -- 快照内容的全局唯一 ID（uuid4 hex）
+    experiment_id TEXT NOT NULL REFERENCES experiments(id),
+    operation_id  TEXT NOT NULL,         -- 客户端快照幂等键
+    fields        TEXT NOT NULL,         -- JSON：首次请求绑定的字段白名单（有序）
+    taken_at      TEXT NOT NULL,         -- 快照固定的服务端时点（即创建时刻）
+    content       TEXT NOT NULL,         -- JSON：不可变快照内容（不含 digest 列本身）
+    digest        TEXT NOT NULL,         -- content 规范 JSON 的 SHA-256（hex）
+    created_at    TEXT NOT NULL,
+    UNIQUE (experiment_id, operation_id)
+);
 """
 
 
@@ -297,6 +317,10 @@ class EmergencyWindowExpiredError(Exception):
 
 class EmergencyOperationIdConflictError(Exception):
     """operation_id 已被另一个紧急揭盲申请（不同受试者 / 审批人 / 原因）占用。"""
+
+
+class SnapshotOperationIdConflictError(Exception):
+    """快照 operation_id 已被字段白名单不同的另一次快照请求占用。"""
 
 
 class InvalidStateTransitionError(Exception):
@@ -1853,6 +1877,197 @@ def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:
             for row in reveal_rows
         ],
     }
+
+
+def create_result_snapshot(
+    experiment_id: str,
+    operation_id: str,
+    fields: list[str],
+) -> dict[str, Any] | None:
+    """在单个写事务内固定同一时点，生成不可变的脱敏结果快照。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：
+
+    1. 幂等检查：``(实验, operation_id)`` 已存在时，仅当本次字段白名单
+       （字段及顺序）与首次完全一致才返回同一快照；白名单不同抛出
+       :class:`SnapshotOperationIdConflictError`；
+    2. 固定时点：在写锁内读取服务端时间 ``taken_at``，随后所有揭盲 /
+       完成数据均取自该事务的同一 SQLite 一致性读快照；
+    3. 组装：受试者按 ``subject_id`` 升序稳定排序；周期数组长度恒等于
+       实验周期数，第 ``k-1`` 项对应周期 ``k``——未揭盲周期为 ``null``，
+       已揭盲周期只保留字段白名单允许的字段（``subject_id`` 恒含），
+       未完成周期的 ``completed_at`` 为 ``None``。快照任何路径都不读取、
+       不下发 ``sequence_index`` 或完整条件序列；
+    4. 落盘：生成 ``snapshot_id``，对剔除 ``digest`` 后的规范 JSON
+       （键序固定、无多余空白）计算 SHA-256 摘要，内容与摘要一起提交。
+
+    实验不存在时返回 ``None``。
+    """
+    conn = get_connection()
+    try:
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        committed = False
+        try:
+            result = _create_snapshot_locked(
+                conn, experiment_id, operation_id, fields
+            )
+            if result is not None and not result["_replayed"]:
+                conn.execute("COMMIT")
+                committed = True
+            if result is not None:
+                result.pop("_replayed", None)
+            return result
+        finally:
+            if not committed:
+                # 重放（只读）、409、404 或异常时结束事务
+                conn.rollback()
+    finally:
+        conn.close()
+
+
+def _canonical_json(value: Any) -> str:
+    """规范 JSON：键序固定（递归排序）、无多余空白、不转义非 ASCII。
+
+    同一份快照内容无论从何种路径重建，规范化结果都逐字节一致，
+    因此 SHA-256 摘要可作为不可变内容的指纹。
+    """
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _snapshot_digest(body: dict[str, Any]) -> str:
+    """对剔除 digest 字段后的快照内容计算 SHA-256（hex）。"""
+    content = {key: value for key, value in body.items() if key != "digest"}
+    return hashlib.sha256(_canonical_json(content).encode("utf-8")).hexdigest()
+
+
+def _create_snapshot_locked(
+    conn: sqlite3.Connection,
+    experiment_id: str,
+    operation_id: str,
+    fields: list[str],
+) -> dict[str, Any] | None:
+    # 1) 幂等命中：白名单（字段及顺序）一致才返回同一快照，否则 409
+    stored = conn.execute(
+        "SELECT fields, content, digest FROM result_snapshots "
+        "WHERE experiment_id = ? AND operation_id = ?",
+        (experiment_id, operation_id),
+    ).fetchone()
+    if stored is not None:
+        if json.loads(stored["fields"]) != fields:
+            raise SnapshotOperationIdConflictError()
+        body = json.loads(stored["content"])
+        # 持久化的 content 不含 digest，响应时补回同一摘要
+        body["digest"] = stored["digest"]
+        body["_replayed"] = True
+        return body
+
+    # 2) 实验必须存在；周期数取条件数（快照不读取 assignments 的序列 / 下标）
+    experiment_row = conn.execute(
+        "SELECT conditions FROM experiments WHERE id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if experiment_row is None:
+        return None
+    num_periods = len(json.loads(experiment_row["conditions"]))
+
+    # 3) 同一事务快照内取齐全部揭盲 / 完成记录；快照期间其他写入不可见
+    reveal_rows = conn.execute(
+        "SELECT subject_id, period, condition, revealed_at FROM unblindings "
+        "WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchall()
+    completion_rows = conn.execute(
+        "SELECT subject_id, period, completed_at FROM period_completions "
+        "WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchall()
+    assignment_rows = conn.execute(
+        "SELECT subject_id FROM assignments WHERE experiment_id = ?",
+        (experiment_id,),
+    ).fetchall()
+
+    reveals: dict[tuple[str, int], sqlite3.Row] = {
+        (row["subject_id"], row["period"]): row for row in reveal_rows
+    }
+    completions: dict[tuple[str, int], str] = {
+        (row["subject_id"], row["period"]): row["completed_at"]
+        for row in completion_rows
+    }
+
+    # 4) 受试者按 subject_id 稳定排序；周期槽按下标对齐周期序号（1 -> 0）
+    subjects: list[dict[str, Any]] = []
+    for assignment in sorted(assignment_rows, key=lambda row: row["subject_id"]):
+        subject_id = assignment["subject_id"]
+        periods: list[dict[str, Any] | None] = []
+        for period in range(1, num_periods + 1):
+            reveal = reveals.get((subject_id, period))
+            if reveal is None:
+                # 未揭盲周期：以 null 占位，不揭露任何安排
+                periods.append(None)
+                continue
+            # 已揭盲周期：只保留字段白名单允许的字段
+            available = {
+                "period": period,
+                "condition": reveal["condition"],
+                "revealed_at": reveal["revealed_at"],
+                "completed_at": completions.get((subject_id, period)),
+            }
+            periods.append({name: available[name] for name in fields})
+        subjects.append({"subject_id": subject_id, "periods": periods})
+
+    # 5) 固定时点、组装不可变内容并计算摘要
+    taken_at = utc_now().isoformat()
+    snapshot_id = uuid.uuid4().hex
+    body: dict[str, Any] = {
+        "snapshot_id": snapshot_id,
+        "experiment_id": experiment_id,
+        "operation_id": operation_id,
+        "fields": list(fields),
+        "taken_at": taken_at,
+        "subjects": subjects,
+    }
+    digest = _snapshot_digest(body)
+    # 落盘内容不含自引用的 digest（digest 单独成列，读取时补回）
+    content_json = json.dumps(body, ensure_ascii=False)
+
+    conn.execute(
+        "INSERT INTO result_snapshots "
+        "(snapshot_id, experiment_id, operation_id, fields, taken_at, "
+        "content, digest, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            snapshot_id,
+            experiment_id,
+            operation_id,
+            json.dumps(fields, ensure_ascii=False),
+            taken_at,
+            content_json,
+            digest,
+            taken_at,
+        ),
+    )
+
+    body["digest"] = digest
+    body["_replayed"] = False
+    return body
+
+
+def get_snapshot(snapshot_id: str) -> dict[str, Any] | None:
+    """按快照 ID 返回不可变快照内容；不存在时返回 ``None``。"""
+    with closing(get_connection()) as conn:
+        row = conn.execute(
+            "SELECT content, digest FROM result_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    body = json.loads(row["content"])
+    # 以持久化摘要列为准补回（content 本身不含 digest）
+    body["digest"] = row["digest"]
+    return body
 
 
 def get_experiment(experiment_id: str) -> dict[str, Any] | None:
